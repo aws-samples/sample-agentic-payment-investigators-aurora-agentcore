@@ -1,0 +1,1774 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks: [E3030]   # PYTHON_3_14 valid per docs + live deploys; lint schema stale
+Description: >
+  Payment Investigation Workshop — full stack. One dual-mode
+  template: Workshop Studio events (IsWorkshopStudioEnv=yes, WS injects the
+  assets bucket) and public self-deploy (default no, assets from the public
+  bucket). Every requirement here fixes a failure hit on real deploys:
+  s3Import role + propagation retry, secretsmanager
+  VPCE SG rule, S3 gateway on DB route tables, exec-role GetSecretValue,
+  requestHeaderAllowlist=[Authorization], workshop_app LOGIN credential,
+  review_queue seeded post-identity with the real analyst sub.
+
+Parameters:
+  IsWorkshopStudioEnv:
+    Type: String
+    Default: "no"
+    AllowedValues: ["no", "yes"]
+    Description: Deployed by Workshop Studio? Leave "no" for self-deploy.
+  MyAssetsBucketName:
+    Type: String
+    Default: ""
+    Description: Please leave blank, reserved for Workshop Studio.
+  MyAssetsBucketPrefix:
+    Type: String
+    Default: ""
+    Description: Please leave blank, reserved for Workshop Studio.
+  PublicAssetsBase:
+    Type: String
+    Default: auto
+    Description: >-
+      bucket/prefix for self-deploy assets (public-read objects). "auto"
+      resolves to this stack's own region's mirror — Lambda code objects
+      MUST be same-region (PermanentRedirect otherwise).
+  AuroraEngineVersion:
+    Type: String
+    Default: "18.3"                       # version pin; bump only at refresh windows
+  ModelId:
+    Type: String
+    Default: global.anthropic.claude-haiku-4-5-20251001-v1:0   # pinned; global profile
+  CopilotModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-5   # in-app chatbot.
+    # Model access differs by account: check that your account can invoke
+    # this model (a 5-token converse call is enough) before you deploy.
+    # The bootstrap model probe is non-fatal.
+  EmbedModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v2:0       # pinned; corpus embedded with THIS —
+    # changing it mid-lifecycle invalidates every stored vector (re-seed required)
+  RerankModelId:
+    Type: String
+    Default: cohere.rerank-v3-5                 # module-6 stage 2 (region-relative ARN
+    # derives in config.py; probed available us-east-1 + us-west-2)
+  WebHostAmi:
+    Type: String
+    Default: ""
+    Description: >-
+      Override the WebHost image with one AMI id (the value is region-specific).
+      Blank, the default, chooses by path. A Workshop Studio event uses the
+      dated image pinned for its Region in the WebHostAmiPin mapping. A
+      self-deploy stack uses the latest AL2023 arm64 image on the kernel-6.18
+      line via SSM (the line every validated bed since 2026-08 booted on; the
+      "kernel-default" alias flips kernel majors upstream). The SSM resolve
+      re-evaluates on EVERY update (caught by change-set probe 2026-07-29).
+      After an upstream AMI refresh the launch template gets a new version:
+      the running instance is kept and the next instance the Auto Scaling
+      group launches boots the newer image. Set this parameter on a
+      long-lived self-deploy stack.
+
+Conditions:
+  IsWS: !Equals [!Ref IsWorkshopStudioEnv, "yes"]
+  DefaultAssets: !Equals [!Ref PublicAssetsBase, "auto"]
+  HasAmiPin: !Not [!Equals [!Ref WebHostAmi, ""]]
+
+Mappings:
+  # Public DNS suffix of an EC2 public IPv4 address: ec2-A-B-C-D.<suffix>. The
+  # CloudFront origin is the workbench Elastic IP's name built this way; it
+  # resolves before any instance is attached (MEASURED 2026-10-06, both regions).
+  Ec2PublicDns:
+    us-east-1: { Suffix: compute-1.amazonaws.com }
+    us-west-2: { Suffix: us-west-2.compute.amazonaws.com }
+  # CloudFront origin-facing managed prefix list (com.amazonaws.global.
+  # cloudfront.origin-facing) — pl-ids are region-specific; both VERIFIED
+  # via describe-managed-prefix-lists 2026-08-16.
+  CloudFrontOriginPrefixList:
+    us-east-1: { PLId: pl-3b927c52 }
+    us-west-2: { PLId: pl-82a045eb }
+  # AgentCore VPC-mode AZ-ID allowlist, as listed in the AgentCore VPC
+  # documentation for both Regions. The resolver falls back to the first
+  # two AZs when no allowlisted AZ resolves.
+  AgentCoreAZs:
+    us-east-1: { ZoneIds: "use1-az1,use1-az2,use1-az4" }
+    us-west-2: { ZoneIds: "usw2-az1,usw2-az2,usw2-az3" }
+  # Event freeze (2026-11-10): the workbench image for Workshop Studio events,
+  # one dated AL2023 arm64 image per event Region. Both ids are
+  # al2023-ami-2023.12.20261109.0-kernel-6.18-arm64. An AL2023 image is locked
+  # to its repository version, so the pin also fixes the versions that dnf
+  # installs in bootstrap_webhost.sh (nginx, postgresql15, nodejs22, jq, git).
+  # The images are marked deprecated on 2027-02-02. A deprecated image still
+  # launches by id, but an old image can be deregistered: refresh or remove
+  # this pin in the first build after the event.
+  WebHostAmiPin:
+    us-east-1: { Ami: ami-0cc337c0f1a9da5ed }
+    us-west-2: { Ami: ami-00895f5927efe9147 }
+
+Resources:
+  # ─────────────────────────── network ────────────────────────────────────
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+
+  # AZ resolver: CFN can't map AZ NAMES to AZ IDs, and AgentCore VPC mode only
+  # accepts allowlisted AZ IDs — a 20-line custom resource closes the gap.
+  AzResolverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: describe-azs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: [ec2:DescribeAvailabilityZones, ec2:DescribeInstanceTypeOfferings, ec2:DescribeVpcEndpointServices], Resource: "*" }
+
+  AzResolverFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt AzResolverRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      return cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  props = event["ResourceProperties"]
+                  want = set(props["ZoneIds"].split(","))
+                  ec2 = boto3.client("ec2")
+                  azs = ec2.describe_availability_zones(
+                      Filters=[{"Name": "state", "Values": ["available"]}])["AvailabilityZones"]
+                  ok = [a["ZoneName"] for a in azs if a["ZoneId"] in want]
+                  cand = ok if len(ok) >= 2 else [a["ZoneName"] for a in azs]
+                  # Az1 hosts the single-subnet cognito-idp endpoint, and that
+                  # service is offered in FEWER AZs than the AgentCore
+                  # allowlist (intersection was 2-of-3 even in the authoring
+                  # account; a WS event account drew the unsupported one and
+                  # provisioning died at the endpoint). Front the AZs the
+                  # endpoint service supports IN THIS ACCOUNT.
+                  svc = props.get("EndpointService")
+                  if svc:
+                      d = ec2.describe_vpc_endpoint_services(ServiceNames=[svc])
+                      ep_ok = set(d["ServiceDetails"][0]["AvailabilityZones"])
+                      front = [z for z in cand if z in ep_ok]
+                      if not front:
+                          raise RuntimeError(
+                              f"no AZ satisfies both the AgentCore allowlist and {svc}")
+                      cand = front + [z for z in cand if z not in front]
+                  pick = cand[:2]
+                  # OFFERING check only: the first type that exists in Az1.
+                  # It cannot see live capacity; that fallback is WebHostGroup's
+                  # mixed-instances policy (types x two public subnets).
+                  itype = ""
+                  for cand in props.get("InstanceTypes", "").split(","):
+                      if not cand:
+                          continue
+                      off = ec2.describe_instance_type_offerings(
+                          LocationType="availability-zone",
+                          Filters=[{"Name": "instance-type", "Values": [cand]},
+                                   {"Name": "location", "Values": [pick[0]]}])
+                      if off["InstanceTypeOfferings"]:
+                          itype = cand
+                          break
+                  if props.get("InstanceTypes") and not itype:
+                      raise RuntimeError(f"no offered instance type among {props['InstanceTypes']} in {pick[0]}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"Az1": pick[0], "Az2": pick[1], "InstanceType": itype})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  ResolvedAZs:
+    Type: Custom::AzResolver
+    Properties:
+      ServiceTimeout: 300
+      ServiceToken: !GetAtt AzResolverFn.Arn
+      ZoneIds: !FindInMap [AgentCoreAZs, !Ref "AWS::Region", ZoneIds]
+      # Az1 must also carry this interface-endpoint service (single-subnet
+      # cognito-idp endpoint lives there; AZ support is narrower than the
+      # AgentCore allowlist — one event died on the mismatch)
+      EndpointService: !Sub com.amazonaws.${AWS::Region}.cognito-idp
+      InstanceTypes: m7g.large,m6g.large,m8g.large,t4g.large   # fallback chain (all arm64)
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !GetAtt ResolvedAZs.Az1
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.10.0/24
+      AvailabilityZone: !GetAtt ResolvedAZs.Az1
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !GetAtt ResolvedAZs.Az2
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+
+  IGW: { Type: AWS::EC2::InternetGateway }
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties: { VpcId: !Ref VPC, InternetGatewayId: !Ref IGW }
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttach
+    Properties: { RouteTableId: !Ref PublicRT, DestinationCidrBlock: 0.0.0.0/0, GatewayId: !Ref IGW }
+  PublicRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet, RouteTableId: !Ref PublicRT }
+  PublicSubnetB:                     # second zone for the workbench group's
+    Type: AWS::EC2::Subnet           # capacity fallback (WebHostGroup)
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.42.1.0/24
+      AvailabilityZone: !GetAtt ResolvedAZs.Az2
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+  PublicRTB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRT }
+  PrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties: { VpcId: !Ref VPC }
+  PrivateRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetA, RouteTableId: !Ref PrivateRT }
+  PrivateRTB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnetB, RouteTableId: !Ref PrivateRT }
+
+  WorkshopSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: workshop shared SG (self-referencing 5432 + 443)
+      VpcId: !Ref VPC
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+  SGSelf5432:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkshopSG
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref WorkshopSG
+  # The Secrets Manager VPCE must admit the runtime SG on 443 —
+  # one shared SG self-ref covers endpoint + runtime + seeder + EC2 alike
+  SGSelf443:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkshopSG
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref WorkshopSG
+  SGHttpIn:                                    # CloudFront → EC2 (80)
+    # Origin traffic only: the CloudFront origin-facing managed prefix list
+    # replaces 0.0.0.0/0 (checkov CKV_AWS_260). The WebHost is
+    # never directly public; CloudFront is the only path.
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref WorkshopSG
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !FindInMap [CloudFrontOriginPrefixList, !Ref "AWS::Region", PLId]
+
+  # S3 gateway endpoint on the PRIVATE route table — REQUIRED for Aurora's
+  # server-side table_import_from_s3.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRT]
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref WorkshopSG]
+      PrivateDnsEnabled: true
+  BedrockRuntimeEndpoint:                      # runtime (private) → model calls
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-runtime
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref WorkshopSG]
+      PrivateDnsEnabled: true
+  BedrockAgentRuntimeEndpoint:                 # runtime (private) → Rerank
+    # (bedrock-agent-runtime API; without this the module-9 full-belt
+    # dispute invoke black-holes in find_precedents — no NAT in this VPC)
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-agent-runtime
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref WorkshopSG]
+      PrivateDnsEnabled: true
+  AgentCoreDataEndpoint:                       # runtime (private) → session memory
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.bedrock-agentcore
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroupIds: [!Ref WorkshopSG]
+      PrivateDnsEnabled: true
+
+  # ─────────────────────────── database ───────────────────────────────────
+  S3ImportRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: rds.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: seed-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket]
+                Resource: !If
+                  - IsWS
+                  - - !Sub arn:aws:s3:::${MyAssetsBucketName}
+                    - !Sub arn:aws:s3:::${MyAssetsBucketName}/*
+                  - - !Sub
+                      - arn:aws:s3:::${B}
+                      - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                    - !Sub
+                      - arn:aws:s3:::${B}/*
+                      - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+
+  DBSubnets:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: workshop private subnets
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: !Ref AuroraEngineVersion
+      StorageEncrypted: true                  # AWS-managed key (CKV_AWS_96 / RDS_STORAGE_ENCRYPTED)
+      DatabaseName: workshop
+      MasterUsername: postgres
+      ManageMasterUserPassword: true
+      EnableIAMDatabaseAuthentication: true   # hardening flag (CKV_AWS_162);
+      # password auth via Secrets Manager remains the workshop's auth path
+      ServerlessV2ScalingConfiguration: { MinCapacity: 2, MaxCapacity: 8 }
+      DBSubnetGroupName: !Ref DBSubnets
+      VpcSecurityGroupIds: [!Ref WorkshopSG]
+      AssociatedRoles:                            # CFN-managed s3Import binding
+        - { RoleArn: !GetAtt S3ImportRole.Arn, FeatureName: s3Import }
+      EnableCloudwatchLogsExports: [postgresql]
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      PubliclyAccessible: false
+
+  AppRoleSecret:                                  # workshop_app credential
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: workshop_app DB credential (set by the seeder)
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "workshop_app"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true                   # keep generated credentials shell/URL-safe
+  AnalystSecret:                                   # seeded analyst login (UI + smoke)
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: seeded analyst Cognito credential
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "analyst_martha"}'
+        GenerateStringKey: password
+        PasswordLength: 20
+        ExcludePunctuation: true
+
+  # ─────────────────────────── identity ───────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-analysts
+      Policies:
+        PasswordPolicy: { MinimumLength: 16, RequireUppercase: true, RequireLowercase: true, RequireNumbers: true, RequireSymbols: false }
+      AdminCreateUserConfig: { AllowAdminCreateUserOnly: true }
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: workshop-app
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+  AnalystUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref UserPool
+      Username: analyst_martha
+      MessageAction: SUPPRESS
+
+  # identity fixer (NON-VPC: needs cognito-idp + secretsmanager on the public
+  # internet): sets the analyst's permanent password from AnalystSecret and
+  # returns the user's SUB (RLS identity — needed by the seeder).
+  # WORKSHOP ONLY: the handler also returns the password as resource data so
+  # the sign-in Outputs at the end of this template can pre-fill the lab's
+  # login. A real deployment returns the Sub alone and gives operators the
+  # secret's ARN; the value stays in Secrets Manager.
+  IdentityFixerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: fix-identity
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - { Effect: Allow, Action: [cognito-idp:AdminSetUserPassword, cognito-idp:AdminGetUser], Resource: !GetAtt UserPool.Arn }
+              - { Effect: Allow, Action: secretsmanager:GetSecretValue, Resource: !Ref AnalystSecret }
+  IdentityFixerFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt IdentityFixerRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json
+          import cfnresponse
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      return cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  p = event["ResourceProperties"]
+                  pw = json.loads(boto3.client("secretsmanager").get_secret_value(
+                      SecretId=p["AnalystSecretArn"])["SecretString"])["password"]
+                  idp = boto3.client("cognito-idp")
+                  idp.admin_set_user_password(UserPoolId=p["PoolId"],
+                      Username=p["Username"], Password=pw, Permanent=True)
+                  sub = next(a["Value"] for a in idp.admin_get_user(
+                      UserPoolId=p["PoolId"], Username=p["Username"])["UserAttributes"]
+                      if a["Name"] == "sub")
+                  # workshop only: Password rides back for the sign-in Outputs;
+                  # a real deployment returns Sub alone (see the comment above)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                   {"Sub": sub, "Password": pw})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+  IdentityFixture:
+    Type: Custom::IdentityFixer
+    DependsOn: AnalystUser
+    Properties:
+      ServiceTimeout: 300
+      ServiceToken: !GetAtt IdentityFixerFn.Arn
+      PoolId: !Ref UserPool
+      Username: analyst_martha
+      AnalystSecretArn: !Ref AnalystSecret
+      SchemaVersion: "2"   # bump to force re-run when the RESPONSE shape changes
+
+  # ─────────────────────────── seeder ──────────────────────────────────────
+  # VPC Lambda (reaches Aurora privately; S3 via gateway endpoint, secrets via
+  # VPCE). provisioner.zip ships in assets (schema.sql + indexes_postload.sql +
+  # load_seeds.py + psycopg wheel — built by webui/Makefile zip-assets).
+  # Handles the s3Import credential-propagation lag with retry (an ACTIVE
+  # role association can take ~1-2 min before it is actually usable).
+  SeederRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: seed
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!GetAtt AuroraCluster.MasterUserSecret.SecretArn, !Ref AppRoleSecret]
+              - Effect: Allow                       # key probing + bucket-region
+                # lookup, scoped to the two possible assets buckets (CKV_AWS_108)
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${B}
+                    - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                  - !Sub
+                    - arn:aws:s3:::${B}/*
+                    - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                  - !If [IsWS, !Sub "arn:aws:s3:::${MyAssetsBucketName}", !Ref AWS::NoValue]
+                  - !If [IsWS, !Sub "arn:aws:s3:::${MyAssetsBucketName}/*", !Ref AWS::NoValue]
+  SeederFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: seeder.handler
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt SeederRole.Arn
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref WorkshopSG]
+      Code:
+        S3Bucket: !If
+          - IsWS
+          - !Ref MyAssetsBucketName
+          - !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+        S3Key: !If
+          - IsWS
+          - !Sub ${MyAssetsBucketPrefix}provisioner.zip
+          - !Sub
+            - ${P}/provisioner.zip
+            - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+  SeedDatabase:
+    Type: Custom::Seeder
+    # DependsOn includes the ROUTE TABLE ASSOCIATIONS: on stack delete CFN
+    # removes parallel resources first — losing PrivateRTA/B drops the S3
+    # gateway route and the VPC Lambda can no longer answer CFN's response
+    # URL → 1-hour hang, DELETE_FAILED (observed on real stack deletes).
+    DependsOn: [AuroraInstance, S3GatewayEndpoint, SecretsManagerEndpoint,
+                PrivateRTA, PrivateRTB, SGSelf443]
+    Properties:
+      ServiceTimeout: 300
+      ServiceToken: !GetAtt SeederFn.Arn
+      DbHost: !GetAtt AuroraCluster.Endpoint.Address
+      MasterSecretArn: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      AppSecretArn: !Ref AppRoleSecret
+      SeedBucket: !If
+        - IsWS
+        - !Ref MyAssetsBucketName
+        - !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+      SeedPrefix: !If
+        - IsWS
+        - !Sub ${MyAssetsBucketPrefix}seeds/
+        - !Sub
+          - ${P}/seeds/
+          - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+      AnalystSub: !GetAtt IdentityFixture.Sub     # review_queue seeding (post-identity)
+      Region: !Ref AWS::Region
+
+  # ─────────────────────────── agent runtime ──────────────────────────────
+  DeployBucket:
+    # Per-stack PRIVATE bucket for the runtime's CodeZip — the module-9 deploy
+    # target. NOT the assets bucket: in BOTH modes that bucket is read-only to
+    # the stack (WS bucket policy / shared public bucket), and deploy.sh must
+    # WRITE here. Found live 2026-07-29: deploy.sh "upload where the runtime
+    # points" against the shared bucket = AccessDenied for attendees, and in
+    # the author account would clobber the published bundle for every future
+    # self-deploy. BundleCopy seeds it at provision; empties it at delete.
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true,
+                                        IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:                        # explicit SSE-S3 (S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED)
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LoggingConfiguration: {}   # self-targeted access logs (CKV_AWS_18);
+      # scratch bucket that ever holds ~2 objects — a dedicated log bucket
+      # would itself be flagged for not having logging
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+  BundleCopyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: copy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow                     # read the published bundle —
+                # scoped to the EXACT key in each mode (checkov CKV_AWS_108)
+                Action: s3:GetObject
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${B}/${P}/agent/bundle.zip
+                    - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                      P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                  - !If
+                    - IsWS
+                    - !Sub arn:aws:s3:::${MyAssetsBucketName}/${MyAssetsBucketPrefix}agent/bundle.zip
+                    - !Ref AWS::NoValue
+              - Effect: Allow                     # seed at provision + empty at teardown
+                Action: [s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource: [!GetAtt DeployBucket.Arn, !Sub "${DeployBucket.Arn}/*"]
+  BundleCopyFn:
+    # No VPC config on purpose: S3 via Lambda's own networking, zero coupling
+    # to the VPC endpoints (and none of the delete-ordering hazards the VPC
+    # seeder needed DependsOn armor for).
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      Role: !GetAtt BundleCopyRole.Arn
+      Code:
+        ZipFile: |
+          # Custom::BundleCopy — seed DeployBucket with the published agent
+          # bundle. NEVER overwrites an existing key: after the attendee's
+          # first module-9 deploy, the bucket holds THEIR code, and a stack
+          # update must not regress it. Delete = empty the bucket so the
+          # bucket resource can go.
+          import boto3
+          # own line REQUIRED: CFN injects the module only when the literal
+          # text "import cfnresponse" appears in ZipFile (combined imports
+          # don't match — ImportModuleError, verified 2026-07-29)
+          import cfnresponse
+          def handler(event, context):
+              try:
+                  p = event["ResourceProperties"]
+                  s3 = boto3.client("s3")
+                  dest, key = p["DestBucket"], p["DestKey"]
+                  if event["RequestType"] == "Delete":
+                      pages = s3.get_paginator("list_objects_v2").paginate(Bucket=dest)
+                      for pg in pages:
+                          for o in pg.get("Contents", []):
+                              s3.delete_object(Bucket=dest, Key=o["Key"])
+                  else:
+                      try:
+                          s3.head_object(Bucket=dest, Key=key)
+                      except s3.exceptions.ClientError:
+                          s3.copy_object(Bucket=dest, Key=key,
+                                         CopySource={"Bucket": p["SourceBucket"],
+                                                     "Key": p["SourceKey"]})
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                                   "bundle-copy-" + dest)
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {"Error": str(e)},
+                                   event.get("PhysicalResourceId", "bundle-copy"))
+  BundleCopy:
+    Type: Custom::BundleCopy
+    Properties:
+      ServiceTimeout: 300     # a stuck copy fails the stack in 5 min, not 1 h
+      ServiceToken: !GetAtt BundleCopyFn.Arn
+      DestBucket: !Ref DeployBucket
+      DestKey: agent/bundle.zip
+      SourceBucket: !If [IsWS, !Ref MyAssetsBucketName, !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]]
+      SourceKey: !If
+        - IsWS
+        - !Sub ${MyAssetsBucketPrefix}agent/bundle.zip
+        - !Sub
+          - ${P}/agent/bundle.zip
+          - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+
+  RuntimeExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: bedrock-agentcore.amazonaws.com }, Action: sts:AssumeRole }]
+      Policies:
+        - PolicyName: runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow                       # profile + underlying models —
+                # the documented cross-region-inference pair: our inference
+                # profiles (any region, this account) + the foundation models
+                # they route to (any region)
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream]
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Effect: Allow                       # module 6 stage 2:
+                # Rerank is a bedrock-agent-runtime action; the
+                # marketplace grants cover the third-party auto-subscribe on
+                # first invoke (cohere.rerank-v3-5 — probed both regions)
+                Action: [bedrock:Rerank, aws-marketplace:Subscribe,
+                         aws-marketplace:ViewSubscriptions]
+                Resource: "*"
+              - Effect: Allow                       # not granted by default — must be explicit
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppRoleSecret
+              - Effect: Allow                       # log-group-scoped (CKV_AWS_111)
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+              - Effect: Allow                       # X-Ray has NO resource-level
+                # permissions; "*" is the only valid resource for Put* (AWS docs)
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: "*"
+              - Effect: Allow                       # CodeZip fetch — the per-stack
+                # deploy bucket only (CKV_AWS_108)
+                Action: s3:GetObject
+                Resource: !Sub ${DeployBucket.Arn}/*
+              - Effect: Allow                       # VPC-mode ENI writes, scoped to
+                # this account+region (covers network-interface, subnet, and
+                # security-group resource types) — CKV_AWS_111
+                Action: [ec2:CreateNetworkInterface, ec2:DeleteNetworkInterface]
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:*
+              - Effect: Allow                       # read-only lookups; Describe*
+                # has no resource-level scoping
+                Action: [ec2:DescribeNetworkInterfaces, ec2:DescribeSubnets,
+                         ec2:DescribeSecurityGroups, ec2:DescribeVpcs]
+                Resource: "*"
+              - Effect: Allow                       # session memory data plane
+                Action: [bedrock-agentcore:CreateEvent, bedrock-agentcore:ListEvents,
+                         bedrock-agentcore:GetEvent, bedrock-agentcore:ListSessions]
+                Resource: !GetAtt SessionMemory.MemoryArn
+
+  # Session memory (STM only, no LTM strategies): gives the per-request
+  # constructed agents conversational continuity across invocations of the
+  # same runtimeSessionId. Verified 2026-07-23: AgentCoreMemorySessionManager
+  # restores prior turns into a FRESH Agent object (per-request construction
+  # preserved). 7-day event expiry ≫ any workshop session.
+  SessionMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Properties:
+      Name: !Sub
+        - pws_memory_${Suffix}
+        - Suffix: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      Description: payment investigator session memory (STM)
+      EventExpiryDuration: 7
+
+  RuntimeManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: manage-runtime
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                # bedrock-agentcore:* — CreateAgentRuntime fans out into
+                # secondary control-plane calls (DEFAULT endpoint, workload
+                # identity, …); scoping tighter surfaces successive 403s.
+                # Stack-internal Lambda role, never a participant surface.
+                Action: bedrock-agentcore:*
+                Resource: "*"
+              - Effect: Allow                     # CreateAgentRuntime validates the
+                # CodeZip with the CALLER's credentials (without this it fails:
+                # "Access denied when trying to retrieve zip file from S3")
+                Action: s3:GetObject
+                Resource: !Sub ${DeployBucket.Arn}/*
+              - Effect: Allow                     # CreateAgentRuntime passes the exec role
+                Action: iam:PassRole
+                Resource: !GetAtt RuntimeExecRole.Arn
+                Condition: { StringEquals: { iam:PassedToService: bedrock-agentcore.amazonaws.com } }
+              - Effect: Allow                     # first runtime in a FRESH account
+                # needs TWO SLRs: runtime-identity (JWT authorizer) AND network
+                # (VPC mode). Without this grant, CreateAgentRuntime fails with
+                # "Failed creating service linked role" in any account where
+                # the SLRs do not already exist.
+                Action: iam:CreateServiceLinkedRole
+                Resource:
+                  - arn:aws:iam::*:role/aws-service-role/runtime-identity.bedrock-agentcore.amazonaws.com/*
+                  - arn:aws:iam::*:role/aws-service-role/network.bedrock-agentcore.amazonaws.com/*
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - runtime-identity.bedrock-agentcore.amazonaws.com
+                      - network.bedrock-agentcore.amazonaws.com
+  RuntimeManagerFn:
+    # SDK-creates the provision-time runtime (NOT AWS::BedrockAgentCore::Runtime).
+    # Unmanaged-by-CFN is the point: module 9's `agentcore import runtime` does a
+    # real CFN IMPORT, and CFN refuses resources already owned by another stack
+    # (CFN rejects the import: "already managed by stack <name>"). Handler
+    # ships in provisioner.zip (runtime_manager.py, boto3 vendored — the Lambda
+    # runtime's boto3 predates the bedrock-agentcore-control model).
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: runtime_manager.handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt RuntimeManagerRole.Arn
+      Code:
+        S3Bucket: !If
+          - IsWS
+          - !Ref MyAssetsBucketName
+          - !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+        S3Key: !If
+          - IsWS
+          - !Sub ${MyAssetsBucketPrefix}provisioner.zip
+          - !Sub
+            - ${P}/provisioner.zip
+            - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+  InvestigatorRuntime:
+    Type: Custom::AgentRuntime
+    DependsOn: [BedrockRuntimeEndpoint, BundleCopy]
+    Properties:
+      ServiceTimeout: 900
+      ServiceToken: !GetAtt RuntimeManagerFn.Arn
+      Region: !Ref AWS::Region
+      RuntimeName: !Sub
+        - pws_investigator_${Suffix}
+        - Suffix: !Select [0, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      CodeBucket: !Ref DeployBucket
+      CodeKey: agent/bundle.zip
+      RoleArn: !GetAtt RuntimeExecRole.Arn
+      Subnets: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+      SecurityGroups: [!Ref WorkshopSG]
+      DiscoveryUrl: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration
+      AllowedClients: [!Ref UserPoolClient]
+      EnvironmentVariables:
+        WORKSHOP_DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+        WORKSHOP_DB_NAME: workshop
+        WORKSHOP_DB_USER: workshop_app
+        WORKSHOP_DB_SECRET_ARN: !Ref AppRoleSecret
+        # HNSW recall floor — libpq startup option (Aurora denies the
+        # catalog-level ALTER for extension GUCs; see indexes_postload.sql)
+        PGOPTIONS: -c hnsw.ef_search=200
+        WORKSHOP_MODEL_REGION: !Ref AWS::Region
+        WORKSHOP_MODEL_ID: !Ref ModelId
+        WORKSHOP_COPILOT_MODEL_ID: !Ref CopilotModelId
+        WORKSHOP_EMBED_MODEL_ID: !Ref EmbedModelId
+        WORKSHOP_RERANK_MODEL_ID: !Ref RerankModelId
+        WORKSHOP_MEMORY_ID: !GetAtt SessionMemory.MemoryId
+        # Module-4 contract: the provision-time DisputeInvestigator matches the
+        # module-4 tool belt (invoke.sh 4127 must investigate, never auto-file).
+        # The attendee's module-9 CLI deploy creates a SEPARATE runtime running
+        # the full workspace; this incumbent keeps serving intro/dev-loop beats.
+        AGENT_STAGE: evidence
+
+  CdkBootstrapRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: bootstrap
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow                     # deploy/inspect ONLY the CDKToolkit stack
+                Action: [cloudformation:CreateStack, cloudformation:DescribeStacks,
+                         cloudformation:GetTemplate]
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*
+              - Effect: Allow                     # fetches ONLY the vendored CDK
+                # bootstrap template (CKV_AWS_108)
+                Action: s3:GetObject
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${B}/${P}/vendor/cdk-bootstrap-template.yaml
+                    - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                      P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                  - !If [IsWS, !Sub "arn:aws:s3:::${MyAssetsBucketName}/${MyAssetsBucketPrefix}vendor/cdk-bootstrap-template.yaml", !Ref AWS::NoValue]
+              - Effect: Allow                     # resources the bootstrap template creates,
+                # name-scoped to the cdk-* convention (qualifier hnb659fds).
+                # Delete/Detach verbs included so a FAILED CDKToolkit create can
+                # ROLL BACK cleanly (without them the stack wedges ROLLBACK_FAILED).
+                Action: [iam:CreateRole, iam:GetRole, iam:GetRolePolicy, iam:PutRolePolicy,
+                         iam:AttachRolePolicy, iam:DetachRolePolicy, iam:DeleteRole,
+                         iam:DeleteRolePolicy, iam:TagRole, iam:PassRole,
+                         iam:CreatePolicy, iam:GetPolicy, iam:CreatePolicyVersion,
+                         iam:ListPolicyVersions, iam:DeletePolicy, iam:DeletePolicyVersion]
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/cdk-*
+                  - !Sub arn:aws:iam::${AWS::AccountId}:policy/cdk-*
+              - Effect: Allow
+                Action: [s3:CreateBucket, s3:PutBucketPolicy, s3:PutBucketVersioning,
+                         s3:PutEncryptionConfiguration, s3:PutBucketPublicAccessBlock,
+                         s3:PutLifecycleConfiguration, s3:GetBucketPolicy, s3:GetBucketLocation,
+                         s3:PutBucketLogging,   # staging bucket self-logs (found live 2026-08-16:
+                         # bootstrap 403s here without it)
+                         s3:DeleteBucket, s3:DeleteBucketPolicy]
+                Resource: arn:aws:s3:::cdk-*
+              - Effect: Allow
+                Action: [ecr:CreateRepository, ecr:DescribeRepositories, ecr:SetRepositoryPolicy,
+                         ecr:PutLifecyclePolicy, ecr:PutImageTagMutability, ecr:TagResource,
+                         ecr:DeleteRepository]
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/cdk-*
+              # (kms statements removed 2026-08-16: the bootstrap is invoked with
+              # FileAssetsBucketKmsKeyId=AWS_MANAGED_KEY, so the template never
+              # creates a KMS key. Historical note: kms:CreateKey could not be
+              # resource-scoped, which kept this role at one scan finding.)
+              - Effect: Allow
+                Action: [ssm:PutParameter, ssm:GetParameter, ssm:GetParameters,
+                         ssm:DeleteParameter]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*
+              - Effect: Allow                     # rollback of a failed CDKToolkit create
+                Action: [cloudformation:DeleteStack]
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*
+  # Execution policy for the attendee's CDK deploys. The upstream `cdk bootstrap`
+  # default attaches AdministratorAccess to cdk-hnb659fds-cfn-exec-role; this
+  # stack passes its own policy instead (CloudFormationExecutionPolicies). The
+  # contents are what the AgentCore-* stack needs, MEASURED in CloudTrail on
+  # bed47 2026-10-05 (runtime + workload identity, KMS via S3 for the CDK assets
+  # bucket, the bootstrap version parameter), plus the delete/update verbs a
+  # rollback needs and the PassRole that CreateAgentRuntime performs.
+  CdkExecPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: CloudFormation execution policy for the attendee's AgentCore-* CDK stack (replaces the bootstrap default AdministratorAccess)
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow                      # the runtime the attendee's stack creates
+            Action: [bedrock-agentcore:CreateAgentRuntime, bedrock-agentcore:UpdateAgentRuntime,
+                     bedrock-agentcore:DeleteAgentRuntime, bedrock-agentcore:GetAgentRuntime,
+                     bedrock-agentcore:ListAgentRuntimes,
+                     bedrock-agentcore:CreateAgentRuntimeEndpoint, bedrock-agentcore:UpdateAgentRuntimeEndpoint,
+                     bedrock-agentcore:DeleteAgentRuntimeEndpoint, bedrock-agentcore:GetAgentRuntimeEndpoint,
+                     bedrock-agentcore:CreateWorkloadIdentity, bedrock-agentcore:GetWorkloadIdentity,
+                     bedrock-agentcore:UpdateWorkloadIdentity, bedrock-agentcore:DeleteWorkloadIdentity,
+                     bedrock-agentcore:TagResource, bedrock-agentcore:UntagResource,
+                     bedrock-agentcore:ListTagsForResource]
+            Resource: "*"                      # runtime ids are service-generated
+          - Effect: Allow                      # CreateAgentRuntime passes the runtime's role
+            Action: iam:PassRole
+            Resource: !GetAtt RuntimeExecRole.Arn
+            Condition: { StringEquals: { iam:PassedToService: bedrock-agentcore.amazonaws.com } }
+          - Effect: Allow                      # CDK assets bucket, AWS-managed S3 key
+            Action: [kms:Decrypt, kms:GenerateDataKey, kms:DescribeKey]
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub arn:aws:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}/*
+          - Effect: Allow                      # bootstrap version check
+            Action: [ssm:GetParameter, ssm:GetParameters]
+            Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*
+  CdkBootstrapFn:
+    # Idempotent `cdk bootstrap` without the CDK CLI: deploys the toolkit-lib
+    # bootstrap template (vendored beside the other assets — same version as
+    # the vendored @aws/agentcore CLI) as stack CDKToolkit, unless the
+    # /cdk-bootstrap/hnb659fds/version SSM param already says it exists.
+    # Module 9's `agentcore deploy` requires this bootstrap in the account.
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      Role: !GetAtt CdkBootstrapRole.Arn
+      Code:
+        ZipFile: |
+          import time
+          import boto3
+          # own line REQUIRED: CFN injects the module only on a literal match
+          import cfnresponse
+          def handler(event, context):
+              try:
+                  p = event["ResourceProperties"]
+                  iam = boto3.client("iam")
+                  if event["RequestType"] == "Delete":
+                      # leave CDKToolkit in place: reclaimed accounts are wiped
+                      # anyway, and shared accounts may have other CDK users.
+                      # Detach THIS stack's exec policy so CloudFormation can delete it.
+                      try:
+                          iam.detach_role_policy(RoleName=p["ExecRoleName"],
+                                                 PolicyArn=p["ExecPolicyArn"])
+                      except Exception as e:
+                          print("detach skipped:", e)
+                      return cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                              {}, "cdk-bootstrap")
+                  ssm = boto3.client("ssm")
+                  cfn = boto3.client("cloudformation")
+                  try:
+                      v = ssm.get_parameter(Name="/cdk-bootstrap/hnb659fds/version")
+                      print("bootstrap present, version", v["Parameter"]["Value"])
+                      # an existing toolkit keeps its own exec policies; add this
+                      # stack's so a redeploy in an account this template once
+                      # bootstrapped still has the verbs the AgentCore-* stack needs
+                      try:
+                          iam.attach_role_policy(RoleName=p["ExecRoleName"],
+                                                 PolicyArn=p["ExecPolicyArn"])
+                      except Exception as e:
+                          print("attach skipped:", e)
+                      return cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                              {"Version": v["Parameter"]["Value"]}, "cdk-bootstrap")
+                  except ssm.exceptions.ParameterNotFound:
+                      pass
+                  # a PRIOR failed attempt can leave a CDKToolkit shell in a
+                  # rollback/failed state; create_stack would then AlreadyExists.
+                  # Clear only a non-live shell (never a COMPLETE toolkit someone
+                  # else uses), then (re)create.
+                  try:
+                      st = cfn.describe_stacks(StackName="CDKToolkit")["Stacks"][0]["StackStatus"]
+                      if st in ("ROLLBACK_COMPLETE", "ROLLBACK_FAILED",
+                                "CREATE_FAILED", "DELETE_FAILED"):
+                          print("clearing stale CDKToolkit in", st)
+                          cfn.delete_stack(StackName="CDKToolkit")
+                          waiter = cfn.get_waiter("stack_delete_complete")
+                          waiter.wait(StackName="CDKToolkit",
+                                      WaiterConfig={"Delay": 10, "MaxAttempts": 40})
+                  except cfn.exceptions.ClientError:
+                      pass   # no existing CDKToolkit — normal first bootstrap
+                  cfn.create_stack(
+                      StackName="CDKToolkit",
+                      TemplateURL=p["TemplateUrl"],
+                      Capabilities=["CAPABILITY_NAMED_IAM"],
+                      Parameters=[{"ParameterKey": "PublicAccessBlockConfiguration",
+                                   "ParameterValue": "true"},
+                                  # AWS-managed S3 key: no KMS key resource is
+                                  # created, so CdkBootstrapRole needs no kms:*
+                                  {"ParameterKey": "FileAssetsBucketKmsKeyId",
+                                   "ParameterValue": "AWS_MANAGED_KEY"},
+                                  # scoped exec policy instead of AdministratorAccess
+                                  {"ParameterKey": "CloudFormationExecutionPolicies",
+                                   "ParameterValue": p["ExecPolicyArn"]}])
+                  for _ in range(50):
+                      st = cfn.describe_stacks(StackName="CDKToolkit")["Stacks"][0]["StackStatus"]
+                      if st == "CREATE_COMPLETE":
+                          return cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                                  {"Version": "created"}, "cdk-bootstrap")
+                      if "FAILED" in st or "ROLLBACK" in st:
+                          raise RuntimeError("CDKToolkit " + st)
+                      time.sleep(10)
+                  raise RuntimeError("CDKToolkit not complete in time")
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)},
+                                   event.get("PhysicalResourceId", "cdk-bootstrap"))
+  CdkBootstrap:
+    Type: Custom::CdkBootstrap
+    Properties:
+      ServiceTimeout: 600
+      ServiceToken: !GetAtt CdkBootstrapFn.Arn
+      ExecPolicyArn: !Ref CdkExecPolicy
+      ExecRoleName: !Sub cdk-hnb659fds-cfn-exec-role-${AWS::AccountId}-${AWS::Region}
+      TemplateUrl: !If
+        - IsWS
+        - !Sub https://${MyAssetsBucketName}.s3.${AWS::Region}.amazonaws.com/${MyAssetsBucketPrefix}vendor/cdk-bootstrap-template.yaml
+        - !Sub
+          - https://${B}.s3.${AWS::Region}.amazonaws.com/${P}/vendor/cdk-bootstrap-template.yaml
+          - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+            P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+
+  # ─────────────────────────── web host ───────────────────────────────────
+  WebHostRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: webhost
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: [!Ref AppRoleSecret, !Ref AnalystSecret]
+              - Effect: Allow                      # attach the stack's Elastic IP at boot
+                Action: ec2:AssociateAddress
+                Resource:
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:elastic-ip/${WebHostEIP.AllocationId}
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              - Effect: Allow                      # bootstrap asset pulls, scoped to
+                # the two possible assets buckets (CKV_AWS_108)
+                Action: s3:GetObject
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${B}
+                    - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                  - !Sub
+                    - arn:aws:s3:::${B}/*
+                    - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                  - !If [IsWS, !Sub "arn:aws:s3:::${MyAssetsBucketName}", !Ref AWS::NoValue]
+                  - !If [IsWS, !Sub "arn:aws:s3:::${MyAssetsBucketName}/*", !Ref AWS::NoValue]
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/workshop/bootstrap*
+              - Effect: Allow                      # bedrock warmup (fresh-account race)
+                Action: [bedrock:InvokeModel, bedrock:InvokeModelWithResponseStream,
+                         bedrock:Rerank, aws-marketplace:Subscribe,
+                         aws-marketplace:ViewSubscriptions]
+                Resource: "*"
+              - Effect: Allow                      # module 9: attendee's `agentcore
+                # deploy` creates + versions THEIR runtime; read-backs cover both
+                # runtimes (theirs + the SDK-created incumbent). Control-plane
+                # runtime verbs only — memory/gateway CRUD stays off this role.
+                Action: [bedrock-agentcore:CreateAgentRuntime,
+                         bedrock-agentcore:GetAgentRuntime,
+                         bedrock-agentcore:UpdateAgentRuntime,
+                         bedrock-agentcore:DeleteAgentRuntime,
+                         bedrock-agentcore:ListAgentRuntimes,
+                         bedrock-agentcore:ListAgentRuntimeVersions,
+                         bedrock-agentcore:ListAgentRuntimeEndpoints,
+                         bedrock-agentcore:GetAgentRuntimeEndpoint,
+                         bedrock-agentcore:CreateAgentRuntimeEndpoint,
+                         bedrock-agentcore:ListTagsForResource,
+                         bedrock-agentcore:TagResource]
+                Resource: "*"
+              - Effect: Allow                      # session-memory read-back: inspect the
+                # session store by hand (read-only data plane; facilitator/check tooling,
+                # no attendee beat since the 2026-09 cuts)
+                Action: [bedrock-agentcore:ListActors, bedrock-agentcore:ListSessions,
+                         bedrock-agentcore:ListEvents]
+                Resource: !GetAtt SessionMemory.MemoryArn
+              - Effect: Allow                      # CreateAgentRuntime passes the exec role
+                Action: iam:PassRole
+                Resource: !GetAtt RuntimeExecRole.Arn
+                Condition: { StringEquals: { iam:PassedToService: bedrock-agentcore.amazonaws.com } }
+              - Effect: Allow                      # agentcore deploy: CDK pipeline —
+                # assume the bootstrap roles (deploy/file-publishing/lookup); every
+                # other CDK permission comes THROUGH those roles, not this one
+                Action: sts:AssumeRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/cdk-hnb659fds-*
+              - Effect: Allow                      # CDK asset uploads (CLI publishes
+                # direct when the file-publishing role isn't used for small assets)
+                Action: [s3:PutObject, s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub arn:aws:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}
+                  - !Sub arn:aws:s3:::cdk-hnb659fds-assets-${AWS::AccountId}-${AWS::Region}/*
+              - Effect: Allow                      # CDK bootstrap version check
+                Action: [ssm:GetParameter, ssm:GetParameters]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cdk-bootstrap/*
+              - Effect: Allow                      # the attendee's AgentCore-* CDK stack:
+                # READ ONLY. The CDK CLI describes the stack under this role; every
+                # write (CreateChangeSet, ExecuteChangeSet, DescribeStackEvents) goes
+                # through cdk-hnb659fds-deploy-role (MEASURED in CloudTrail, bed47
+                # 2026-10-05: DescribeStacks was the only CloudFormation call here).
+                Action: [cloudformation:DescribeStacks, cloudformation:DescribeStackEvents,
+                         cloudformation:DescribeStackResources, cloudformation:ListStackResources,
+                         cloudformation:GetTemplate]
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/AgentCore-*
+              - Effect: Allow                      # module-9 go-live: repoint the
+                # PRODUCTION bridge (Lambda env) at the attendee's runtime — the
+                # app-tier successor of the retired systemd restart
+                Action: [lambda:GetFunctionConfiguration, lambda:UpdateFunctionConfiguration]
+                Resource: !GetAtt BridgeFn.Arn
+  WebHostProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: { Roles: [!Ref WebHostRole] }
+
+  # Workbench: an Auto Scaling group of ONE behind an Elastic IP, not a bare
+  # instance. A bare AWS::EC2::Instance launches once, in one zone, with one
+  # type, and dies on InsufficientInstanceCapacity (two test events,
+  # 2026-09-28 and 2026-10-06, m7g.large in us-east-1; the resolver's
+  # "fallback" only checked that a type was OFFERED in the zone). The group
+  # retries the other types and the second public subnet by itself. The Elastic
+  # IP gives CloudFront a stable origin whichever zone and type it lands on.
+  WebHostEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags: [{ Key: workshop-id, Value: payment-investigation }, { Key: Name, Value: payment-ws-webhost }]
+  WebHostLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        # WebHostAmi wins when set. Otherwise an event takes the pinned image
+        # for its Region and a self-deploy stack takes the latest one.
+        ImageId: !If
+          - HasAmiPin
+          - !Ref WebHostAmi
+          - !If [IsWS, !FindInMap [WebHostAmiPin, !Ref "AWS::Region", Ami], "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.18-arm64}}"]
+        IamInstanceProfile: { Arn: !GetAtt WebHostProfile.Arn }
+        SecurityGroupIds: [!Ref WorkshopSG]
+        MetadataOptions: { HttpTokens: required }   # bootstrap already uses IMDSv2 tokens
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: workshop-id, Value: payment-investigation }, { Key: Name, Value: payment-ws-webhost }, { Key: role, Value: WebHost }]
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              # bootstrap log → CloudWatch-visible file + cfn-signal EXIT trap
+              exec > /var/log/workshop-bootstrap.log 2>&1
+              finish() {
+                rc=$?
+                if [ $rc -ne 0 ]; then
+                  echo "--- FAILURE (rc=$rc): journalctl workshop-api ---"
+                  journalctl -u workshop-api --no-pager 2>/dev/null | tail -80
+                  echo "--- nginx ---"
+                  systemctl is-active nginx; nginx -t 2>&1 | head -3
+                fi
+                aws logs create-log-group --log-group-name /workshop/bootstrap --region ${AWS::Region} 2>/dev/null || true
+                aws logs create-log-stream --log-group-name /workshop/bootstrap --log-stream-name ${AWS::StackName} --region ${AWS::Region} 2>/dev/null || true
+                # Ship the log as a JSON file, never as an argv value: Linux caps one
+                # argument at 128 KB, so the old shorthand form died with "Argument
+                # list too long" behind 2>/dev/null and every stream stayed empty
+                # (measured on bed43, 2026-10-01). Stderr now lands in this log.
+                python3 -c 'import json,time; m=open("/var/log/workshop-bootstrap.log","rb").read()[-150000:].decode("utf-8","replace"); json.dump([{"timestamp": int(time.time()*1000), "message": m}], open("/tmp/bootstrap-events.json","w"))'
+                aws logs put-log-events --log-group-name /workshop/bootstrap \
+                  --log-stream-name ${AWS::StackName} --region ${AWS::Region} \
+                  --log-events file:///tmp/bootstrap-events.json > /dev/null \
+                  && echo "--- bootstrap log shipped to /workshop/bootstrap/${AWS::StackName} ---" \
+                  || echo "--- bootstrap log ship FAILED (rc=$?) ---"
+                /opt/aws/bin/cfn-signal -e $rc --stack ${AWS::StackName} --resource WebHostGroup --region ${AWS::Region}
+              }
+              trap finish EXIT
+              # Elastic IP first: CloudFront's origin is this address's DNS name,
+              # so the box must own it before anything else (fails the signal if not)
+              TOK=$(curl -sS -m 5 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              IID=$(curl -sS -m 5 -H "X-aws-ec2-metadata-token: $TOK" http://169.254.169.254/latest/meta-data/instance-id)
+              aws ec2 associate-address --region ${AWS::Region} --instance-id "$IID" --allocation-id ${WebHostEIP.AllocationId} --allow-reassociation
+              set -e
+              # stub: export stack values, fetch + run the real bootstrap
+              # (UserData 16KB cap — body lives in the assets bucket)
+              export CFN_REGION=${AWS::Region}
+              export CFN_STACKNAME=${AWS::StackName}
+              export ModelId=${ModelId} CopilotModelId=${CopilotModelId}
+              export EmbedModelId=${EmbedModelId} RerankModelId=${RerankModelId}
+              export AssetsBucket=${AssetsBucket} AssetsPrefix=${AssetsPrefix}
+              export DbHost=${DbHost} AppSecretArn=${AppSecretArn} AnalystSecretArn=${AnalystSecretArn}
+              export RuntimeArn=${RuntimeArn} RuntimeExecRoleArn=${RuntimeExecRoleArn}
+              export BridgeFn=${BridgeFnName}
+              export PrivateSubnetA=${PrivateSubnetA} PrivateSubnetB=${PrivateSubnetB} WorkshopSG=${WorkshopSG}
+              export PoolId=${PoolId} UserPoolClient=${UserPoolClient}
+              dnf install -y aws-cfn-bootstrap
+              aws s3 cp s3://${AssetsBucket}/${AssetsPrefix}bootstrap_webhost.sh /tmp/bootstrap_webhost.sh
+              source /tmp/bootstrap_webhost.sh
+
+            - ModelId: !Ref ModelId
+              CopilotModelId: !Ref CopilotModelId
+              EmbedModelId: !Ref EmbedModelId
+              RerankModelId: !Ref RerankModelId
+              AssetsBucket: !If [IsWS, !Ref MyAssetsBucketName, !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]]
+              AssetsPrefix: !If
+                - IsWS
+                - !Ref MyAssetsBucketPrefix
+                - !Sub
+                  - ${P}/
+                  - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+              DbHost: !GetAtt AuroraCluster.Endpoint.Address
+              AppSecretArn: !Ref AppRoleSecret
+              AnalystSecretArn: !Ref AnalystSecret
+              RuntimeArn: !GetAtt InvestigatorRuntime.AgentRuntimeArn
+              RuntimeExecRoleArn: !GetAtt RuntimeExecRole.Arn
+              PrivateSubnetA: !Ref PrivateSubnetA
+              PrivateSubnetB: !Ref PrivateSubnetB
+              WorkshopSG: !Ref WorkshopSG
+              PoolId: !Ref UserPool
+              BridgeFnName: !Ref BridgeFn
+
+  WebHostGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PublicRoute, PublicRTB]   # the boot needs the internet route; the
+    CreationPolicy:                       # data deps ride the launch template's GetAtts
+      ResourceSignal: { Count: 1, Timeout: PT20M }
+    Properties:
+      MinSize: "1"
+      MaxSize: "1"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier: [!Ref PublicSubnet, !Ref PublicSubnetB]
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 1200
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandAllocationStrategy: prioritized
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 100
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref WebHostLT
+            Version: !GetAtt WebHostLT.LatestVersionNumber
+          Overrides:                      # priority order, all arm64
+            - { InstanceType: m7g.large }
+            - { InstanceType: m6g.large }
+            - { InstanceType: m8g.large }
+            - { InstanceType: c7g.large }
+      Tags:
+        - { Key: workshop-id, Value: payment-investigation, PropagateAtLaunch: true }
+        - { Key: Name, Value: payment-ws-webhost, PropagateAtLaunch: true }
+        - { Key: role, Value: WebHost, PropagateAtLaunch: true }
+
+  # ──────────── app tier: production from provision (POC 2026-08-18) ───────
+  # SPA on S3 behind CloudFront OAC; API bridge (the same api/app.zip surface,
+  # dependency-vendored) on an in-VPC Lambda behind a STREAMING Function URL,
+  # OAC-signed. The EC2 WebHost keeps only the workbench (Code Editor +
+  # terminals). Measured facts this design rests on: LWA RESPONSE_STREAM
+  # preserves SSE chunk pacing end-to-end through CloudFront; Function URL
+  # auth is AWS_IAM ONLY (auth NONE = open resource policy);
+  # the viewer JWT rides x-ws-auth because OAC SigV4 owns Authorization.
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true,
+                                        IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      BucketEncryption:                        # explicit SSE-S3 (S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED)
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LoggingConfiguration: {}   # same disposition as DeployBucket (CKV_AWS_18)
+      Tags: [{ Key: workshop-id, Value: payment-investigation }]
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub "${SiteBucket.Arn}/*"
+            Condition: { StringEquals: { "AWS:SourceArn": !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}" } }
+  SiteOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  BridgeOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-bridge
+        OriginAccessControlOriginType: lambda
+        SigningBehavior: always
+        SigningProtocol: sigv4
+  LwaLayer:
+    # vendored aws-lambda-web-adapter — bucket-resident asset like the
+    # agentcore CLI tarball (public layer is cross-region-unreadable, and
+    # zero-external-fetches applies to layers too)
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${AWS::StackName}-lwa
+      CompatibleRuntimes: [python3.14]
+      Content:
+        S3Bucket: !If [IsWS, !Ref MyAssetsBucketName, !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]]
+        S3Key: !If
+        - IsWS
+        - !Sub "${MyAssetsBucketPrefix}vendor/lwa-layer.zip"
+        - !Sub
+          - ${P}/vendor/lwa-layer.zip
+          - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+  BridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole]
+      Policies:
+        - PolicyName: bridge
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow               # db credentials, per request
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AppRoleSecret
+  BridgeFn:
+    # the api bridge, unchanged FastAPI surface behind the LWA bootstrap
+    # (run.sh -> uvicorn). 300s timeout: agent chat relays outlive any
+    # API-Gateway-class limit — the reason this is a Function URL.
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: run.sh
+      Timeout: 300
+      MemorySize: 1024
+      Role: !GetAtt BridgeRole.Arn
+      Layers: [!Ref LwaLayer]
+      VpcConfig:
+        SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+        SecurityGroupIds: [!Ref WorkshopSG]
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          AWS_LWA_INVOKE_MODE: response_stream
+          PORT: "8080"
+          RUNTIME_ARN: !GetAtt InvestigatorRuntime.AgentRuntimeArn
+          COGNITO_POOL_ID: !Ref UserPool
+          COGNITO_CLIENT_ID: !Ref UserPoolClient
+          WORKSHOP_DB_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          WORKSHOP_DB_NAME: workshop
+          WORKSHOP_DB_USER: workshop_app
+          WORKSHOP_DB_SECRET_ARN: !Ref AppRoleSecret
+          WORKSHOP_MODEL_REGION: !Ref AWS::Region
+      Code:
+        S3Bucket: !If [IsWS, !Ref MyAssetsBucketName, !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]]
+        S3Key: !If
+        - IsWS
+        - !Sub "${MyAssetsBucketPrefix}api/bridge-lambda.zip"
+        - !Sub
+          - ${P}/api/bridge-lambda.zip
+          - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+  BridgeUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt BridgeFn.Arn
+      AuthType: AWS_IAM
+      InvokeMode: RESPONSE_STREAM
+  BridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BridgeFn
+      Action: lambda:InvokeFunctionUrl
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}
+      FunctionUrlAuthType: AWS_IAM
+  BridgeInvokeFunctionPermission:
+    # us-west-2's Function-URL auth plane ALSO requires lambda:InvokeFunction
+    # (us-east-1 accepts InvokeFunctionUrl alone). Measured live 2026-08-19 on
+    # bed27: CloudFront->bridge 403 AccessDeniedException with only the URL
+    # action; add-permission InvokeFunction flipped it to 200. Same asymmetry
+    # as BridgeSmokeRole. IAM simulator says "allowed" either way — only a
+    # live call exposes it, so keep BOTH grants in every region.
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BridgeFn
+      Action: lambda:InvokeFunction
+      Principal: cloudfront.amazonaws.com
+      SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${WebDistribution}
+  CognitoIdpEndpoint:
+    # the bridge verifies JWTs (JWKS fetch) from PRIVATE subnets — the EC2
+    # reached cognito-idp over the internet; a VPC Lambda cannot. AZ-AWARE:
+    # cognito-idp is not present in every AZ (us-east-1c refused, measured
+    # 2026-08-18); single-subnet endpoint — private DNS serves the whole VPC.
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.cognito-idp
+      VpcEndpointType: Interface
+      SubnetIds: [!Ref PrivateSubnetA]
+      SecurityGroupIds: [!Ref WorkshopSG]
+      PrivateDnsEnabled: true
+  SiteDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: deploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource:
+                  - !Sub
+                    - arn:aws:s3:::${B}/*
+                    - B: !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+                  - !If [IsWS, !Sub "arn:aws:s3:::${MyAssetsBucketName}/*", !Ref AWS::NoValue]
+              - Effect: Allow
+                Action: [s3:PutObject, s3:DeleteObject, s3:ListBucket]
+                Resource: [!GetAtt SiteBucket.Arn, !Sub "${SiteBucket.Arn}/*"]
+  SiteDeployFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt SiteDeployRole.Arn
+      Code:
+        ZipFile: |
+          # Custom::SiteDeploy — unpack webui.zip into the site bucket and
+          # stamp config.js (the ONLY per-stack file; formerly stamped on the
+          # EC2 by bootstrap). Delete = empty the bucket so it can go.
+          import io, json, mimetypes, zipfile
+          import boto3
+          # own line REQUIRED (cfnresponse injection matches literal text)
+          import cfnresponse
+          def handler(event, context):
+              try:
+                  p = event["ResourceProperties"]
+                  s3 = boto3.client("s3")
+                  dest = p["SiteBucket"]
+                  if event["RequestType"] == "Delete":
+                      pages = s3.get_paginator("list_objects_v2").paginate(Bucket=dest)
+                      for pg in pages:
+                          for o in pg.get("Contents", []):
+                              s3.delete_object(Bucket=dest, Key=o["Key"])
+                  else:
+                      raw = s3.get_object(Bucket=p["SourceBucket"],
+                                          Key=p["SourceKey"])["Body"].read()
+                      z = zipfile.ZipFile(io.BytesIO(raw))
+                      for name in z.namelist():
+                          if name.endswith("/"):
+                              continue
+                          ct = mimetypes.guess_type(name)[0] or "application/octet-stream"
+                          s3.put_object(Bucket=dest, Key=name, Body=z.read(name),
+                                        ContentType=ct,
+                                        CacheControl="no-cache, must-revalidate")
+                      cfg = ('window.WS_CONFIG = { apiBase: "", region: "%s",\n'
+                             '  cognito: { clientId: "%s" } };\n') % (p["Region"], p["ClientId"])
+                      s3.put_object(Bucket=dest, Key="config.js", Body=cfg.encode(),
+                                    ContentType="text/javascript",
+                                    CacheControl="no-cache, must-revalidate")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {},
+                                   "site-deploy-" + dest)
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {"Error": str(e)},
+                                   event.get("PhysicalResourceId", "site-deploy"))
+  SiteDeploy:
+    Type: Custom::SiteDeploy
+    Properties:
+      ServiceTimeout: 300
+      ServiceToken: !GetAtt SiteDeployFn.Arn
+      SiteBucket: !Ref SiteBucket
+      SourceBucket: !If [IsWS, !Ref MyAssetsBucketName, !Select [0, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]]
+      SourceKey: !If
+        - IsWS
+        - !Sub "${MyAssetsBucketPrefix}webui.zip"
+        - !Sub
+          - ${P}/webui.zip
+          - P: !Select [1, !Split ["/", !If [DefaultAssets, !Sub "payment-ws-public-654654628042-${AWS::Region}/paymentriv2026", !Ref PublicAssetsBase]]]
+      Region: !Ref AWS::Region
+      ClientId: !Ref UserPoolClient
+  BridgeSmokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: smoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                # BOTH actions on purpose: a RESPONSE_STREAM Function URL's
+                # auth plane also evaluates lambda:InvokeFunction in some
+                # regions (MEASURED 2026-08-19: us-west-2 403 Forbidden with
+                # InvokeFunctionUrl alone, 200 with both; us-east-1 passed
+                # on InvokeFunctionUrl alone). IAM simulator says "allowed"
+                # either way — only the live call exposes it.
+                Action: [lambda:InvokeFunctionUrl, lambda:InvokeFunction]
+                Resource: !GetAtt BridgeFn.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref AnalystSecret
+  BridgeSmokeFn:
+    # doors-open smoke, app-tier edition. The EC2 bootstrap can no longer
+    # prove the api (it does not host it, and the distribution does not exist
+    # at boot). Invokes the bridge DIRECTLY with Function-URL-shaped events
+    # (LWA translates) — health, then an authed RLS read with a real Cognito
+    # token. Principled 60s grace for fresh-role IAM propagation, then fail
+    # LOUD (the bed18 lesson: hope-loops hide defects at event scale).
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 540              # covers all three grace loops (see BridgeSmoke)
+      Role: !GetAtt BridgeSmokeRole.Arn
+      Code:
+        ZipFile: |
+          # Custom::BridgeSmoke — doors-open smoke for the production app
+          # tier: SigV4-signed HTTPS against the bridge's Function URL (the
+          # REAL path; direct lambda.invoke of an LWA RESPONSE_STREAM fn
+          # returns the streaming envelope, not JSON — bed25 lesson).
+          # Principled 60s grace for fresh-role/VPCE propagation, then fail
+          # LOUD (hope-loops hide defects at event scale).
+          import json, os, time, urllib.request
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          # own line REQUIRED (cfnresponse injection matches literal text)
+          import cfnresponse
+          def _get(base, path, extra=None):
+              url = base.rstrip("/") + path
+              req = AWSRequest(method="GET", url=url, headers=extra or {})
+              creds = boto3.Session().get_credentials().get_frozen_credentials()
+              SigV4Auth(creds, "lambda", os.environ["AWS_REGION"]).add_auth(req)
+              r = urllib.request.Request(url, headers=dict(req.headers), method="GET")
+              try:
+                  with urllib.request.urlopen(r, timeout=90) as resp:
+                      return resp.status, resp.read().decode()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode()[:300]
+              except Exception as e:                              # noqa: BLE001
+                  return 0, str(e)[:200]
+          def handler(event, context):
+              if event["RequestType"] == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "bridge-smoke")
+                  return
+              try:
+                  p = event["ResourceProperties"]
+                  base = p["FunctionUrl"]
+                  code, body = None, ""
+                  # 18x10s: a FRESH role's InvokeFunctionUrl grant can take
+                  # minutes to propagate to the URL auth plane (bed27 saw 403
+                  # Forbidden past the old 80s window; bed25 dodged it only
+                  # because its smoke ran on an update, role long-since aged)
+                  for i in range(18):
+                      code, body = _get(base, "/api/health")
+                      if code == 200:
+                          break
+                      time.sleep(10)
+                  assert code == 200, f"health never 200 (last={code} {str(body)[:200]})"
+                  pw = json.loads(boto3.client("secretsmanager").get_secret_value(
+                      SecretId=p["AnalystSecretArn"])["SecretString"])["password"]
+                  tok = boto3.client("cognito-idp").initiate_auth(
+                      AuthFlow="USER_PASSWORD_AUTH", ClientId=p["ClientId"],
+                      AuthParameters={"USERNAME": "analyst_martha", "PASSWORD": pw},
+                  )["AuthenticationResult"]["AccessToken"]
+                  code, body = None, ""
+                  for i in range(6):                  # JWKS via the fresh VPCE
+                      code, body = _get(base, "/api/queues",
+                                        {"x-ws-auth": "Bearer " + tok})
+                      if code == 200:
+                          break
+                      time.sleep(10)
+                  assert code == 200 and "case_id" in body, \
+                      f"authed queues failed after 60s grace (last={code} {str(body)[:200]})"
+                  # the ATTENDEE path: plain GET through the distribution —
+                  # CloudFront's OAC does the signing. Direct-URL probes above
+                  # can pass while this 403s: us-west-2 requires the OAC
+                  # principal to hold lambda:InvokeFunction TOO (bed27,
+                  # measured 2026-08-19 — a browser-dead SPA shipped smoke-green)
+                  dist = p.get("DistributionDomain")
+                  if dist:
+                      code, body = None, ""
+                      for i in range(18):             # fresh-grant propagation
+                          try:
+                              with urllib.request.urlopen(
+                                      "https://" + dist + "/api/health",
+                                      timeout=30) as resp:
+                                  code, body = resp.status, resp.read().decode()
+                          except urllib.error.HTTPError as e:
+                              code, body = e.code, e.read().decode()[:200]
+                          except Exception as e:              # noqa: BLE001
+                              code, body = 0, str(e)[:200]
+                          if code == 200:
+                              break
+                          time.sleep(10)
+                      assert code == 200, \
+                          f"CloudFront->bridge dead (last={code} {str(body)[:200]})"
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, "bridge-smoke")
+              except Exception as e:                              # noqa: BLE001
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                   {"Error": str(e)}, "bridge-smoke")
+  BridgeSmoke:
+    Type: Custom::BridgeSmoke
+    # the two Invoke permissions are what the CloudFront-path probe proves —
+    # they must exist before it runs (DistributionDomain already orders the
+    # distribution itself)
+    DependsOn: [SeedDatabase, CognitoIdpEndpoint, IdentityFixture,
+                BridgeInvokePermission, BridgeInvokeFunctionPermission]
+    Properties:
+      ServiceTimeout: 540       # direct grace (180s) + CF-path grace (180s) + probes
+      ServiceToken: !GetAtt BridgeSmokeFn.Arn
+      Nonce: replatform-r4      # bump to force a smoke re-run on update
+      FunctionUrl: !GetAtt BridgeUrl.FunctionUrl
+      DistributionDomain: !GetAtt WebDistribution.DomainName
+      AnalystSecretArn: !Ref AnalystSecret
+      ClientId: !Ref UserPoolClient
+
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        DefaultRootObject: index.html   # S3 origin serves nothing at "/" bare
+        Origins:
+          - Id: site                       # the SPA — S3 via OAC, bucket private
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOAC.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+          - Id: bridge                     # the api — streaming Function URL via OAC
+            DomainName: !Select [2, !Split ["/", !GetAtt BridgeUrl.FunctionUrl]]
+            OriginAccessControlId: !GetAtt BridgeOAC.Id
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              HTTPSPort: 443
+              # SSE idle-between-chunks window (same 60s ceiling as before)
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 5
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: webhost                    # the WORKBENCH only: /code/* editor
+            DomainName: !Join ["", ["ec2-", !Join ["-", !Split [".", !GetAtt WebHostEIP.PublicIp]], ".", !FindInMap [Ec2PublicDns, !Ref "AWS::Region", Suffix]]]
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+              # WebSocket idle window: OriginReadTimeout doubles as the
+              # between-packets timeout on upgraded connections; the 30s
+              # default reload-loops idle code-editor terminals.
+              # 60 = max without a CloudFront quota increase.
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:              # SPA: no caching — config.js and js/
+          TargetOriginId: site             # must never go stale on an update
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad        # CachingDisabled
+        CacheBehaviors:
+          - PathPattern: "/api/*"
+            TargetOriginId: bridge
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad      # CachingDisabled
+            # AllViewerExceptHostHeader: a Function URL must not receive the
+            # viewer Host, and OAC SigV4 owns Authorization toward the origin —
+            # the browser JWT rides x-ws-auth by design (POC 2026-08-18).
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          - PathPattern: "/code/*"
+            TargetOriginId: webhost
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # AllViewer
+
+# MINIMAL outputs: attendees need exactly two urls — clean
+# screencaps for instructions. All internal values (db host, ARNs, pool ids)
+# are seeded into /etc/workshop.env on the web host at provision time; lab
+# terminals auto-source it (profile.d) — `echo $WORKSHOP_DB_HOST` just works.
+#
+# WORKSHOP ONLY: WebUIUrl, CodeEditorUrl and AnalystLogin carry the generated
+# analyst password (URL fragment, editor token, plain text) so an attendee
+# lands on a pre-filled sign-in. Stack Outputs are readable by any principal
+# with cloudformation:DescribeStacks on the account, so this is a convenience
+# for a throwaway lab account with synthetic data, not a pattern to copy. A
+# real deployment outputs the plain URL and the secret's ARN and lets
+# operators read the value from Secrets Manager.
+Outputs:
+  WebUIUrl:
+    Description: "1. Payment Operations UI - open, then click 'Sign in to the floor' (pre-filled)"
+    Value: !Sub
+      - https://${Domain}/#user=analyst_martha&pw=${Token}
+      - Domain: !GetAtt WebDistribution.DomainName
+        Token: !GetAtt IdentityFixture.Password
+  CodeEditorUrl:
+    Description: "2. Code Editor in the browser - one click, token signs you in"
+    Value: !Sub
+      - https://${Domain}/code/?tkn=${Token}
+      - Domain: !GetAtt WebDistribution.DomainName
+        Token: !GetAtt IdentityFixture.Password
+  AnalystLogin:
+    Description: "3. UI sign-in (only needed if link 1 doesn't pre-fill)"
+    Value: !Sub
+      - "username: analyst_martha    password: ${P}"
+      - P: !GetAtt IdentityFixture.Password

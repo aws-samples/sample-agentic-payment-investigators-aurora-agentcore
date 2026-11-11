@@ -1,0 +1,3 @@
+-- Take-home (§7 M2.5): canonical two-CTE FTS+vector RRF fusion, 1/(60+rank),
+-- FULL OUTER JOIN, GIN on to_tsvector. Seeded lexical-wins pair gated by §10.10.
+-- STUB: authored with the seed corpus.

@@ -1,0 +1,26 @@
+# Ignore the `build/` directory in the package root.
+/build
+
+# §8b.6: big artifacts NEVER enter git — assets bucket only
+.assets-out/
+seeds/output/
+*.embeddings.*
+*.copy
+*.zip
+.venv/
+__pycache__/
+*.pyc
+node_modules/
+.DS_Store
+
+# throwaway agentcore project beds
+infra/acproject*/
+
+# local session files, never content
+.claude/
+MOVE-NOTES.md
+
+# AI assistant config
+CLAUDE.md
+.claude/
+AGENTS.md

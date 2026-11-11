@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AnyCompany — Payment Operations</title>
+<link rel="stylesheet" href="styles.css">
+<script src="config.js"></script>
+</head>
+<body>
+  <!-- sign-in gate: the authentic analyst login (creds from the instructions) -->
+  <div id="login-gate" class="login-gate hidden">
+    <form id="login-form" class="login-card" autocomplete="off">
+      <div class="login-brand"><span class="brand-mark mono">AC</span>
+        <div><h1>AnyCompany</h1><p>Payment Operations</p></div></div>
+      <label>Analyst ID
+        <input id="login-user" class="mono" autocapitalize="off" spellcheck="false" required>
+      </label>
+      <label>Password
+        <input id="login-pass" type="password" class="mono" required>
+      </label>
+      <button type="submit" class="btn-signin">Sign in to the floor</button>
+      <p id="login-err" class="login-err" role="alert"></p>
+    </form>
+  </div>
+  <header class="masthead">
+    <div class="masthead-brand">
+      <span class="brand-mark">AC</span>
+      <h1>AnyCompany <span class="brand-sub">Payment Operations</span></h1>
+    </div>
+    <div class="masthead-id">
+      <span id="runtime-dot" class="dot dot-idle" title="agent runtime"></span>
+      <span id="analyst-name" class="mono">signing in…</span>
+    </div>
+  </header>
+
+  <div class="status-strip mono" id="status-strip" aria-live="polite">
+    <span>OPEN DISPUTES <b id="st-disputes">–</b></span>
+    <span>OPEN BREAKS <b id="st-breaks">–</b></span>
+    <span class="strip-review">AWAITING REVIEW <b id="st-review">–</b></span>
+    <span>τ <b id="st-tau">0.70</b></span>
+  </div>
+
+  <div class="frame">
+    <nav class="rail" role="tablist" aria-label="views">
+      <button class="rail-tab active" data-view="queue"  role="tab">Queue</button>
+      <button class="rail-tab" data-view="review" role="tab">Review
+        <span id="review-badge" class="badge hidden">0</span></button>
+      <button class="rail-tab" data-view="traces" role="tab">Traces</button>
+      <button class="rail-tab" data-view="corpus" role="tab">Corpus</button>
+      <div class="rail-spacer"></div>
+      <button id="copilot-toggle" class="rail-copilot" aria-expanded="false">
+        <span class="chip-glyph">◈</span> Copilot</button>
+    </nav>
+
+    <main id="main" class="main" role="tabpanel"><!-- view renders here --></main>
+
+    <aside id="case-panel" class="case-panel hidden" aria-label="case detail">
+      <!-- case detail + Ask the investigator -->
+    </aside>
+  </div>
+
+  <!-- settlement tape: ledger-derived agent activity (action_log rows only) -->
+  <footer id="tape" class="tape" aria-label="settlement tape">
+    <button id="tape-toggle" class="tape-head" aria-expanded="false">
+      <span class="tape-title">SETTLEMENT TAPE
+        <span id="tape-count" class="badge hidden">0</span></span>
+      <span id="tape-latest" class="tape-latest">
+        <span id="tape-empty" class="tape-silent">silent, no agents on duty yet</span>
+      </span>
+      <span class="tape-caret">▴</span>
+    </button>
+    <div id="tape-feed" class="tape-feed" role="log" aria-live="off"></div>
+  </footer>
+
+  <section id="copilot-dock" class="copilot-dock hidden" aria-label="ops copilot">
+    <div class="dock-head">
+      <span><span class="chip-glyph agent">◈</span> Ops copilot</span>
+      <button id="copilot-close" class="ghost" aria-label="close">×</button>
+    </div>
+    <div id="copilot-thread" class="thread"></div>
+    <form id="copilot-form" class="composer">
+      <input id="copilot-input" type="text" autocomplete="off"
+             placeholder="What's on the floor today?" aria-label="ask the copilot">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
