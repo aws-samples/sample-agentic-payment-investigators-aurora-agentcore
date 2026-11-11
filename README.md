@@ -71,6 +71,56 @@ workshop. The workshop provisions the complete environment (Aurora, the
 deployed runtime, the UI, a browser IDE) and walks the build tool by tool:
 [Build agentic payment investigators on Aurora PostgreSQL & AgentCore](https://catalog.us-east-1.prod.workshops.aws/workshops/658429e1-f014-4b4a-a0a5-84d83f85dc73).
 
+**Self-deploy:** the CloudFormation template deploys the full stack in
+about 15 minutes. **This creates billable resources** — an Aurora
+Serverless v2 cluster, an EC2 instance, a Lambda function behind a CloudFront
+distribution, VPC interface endpoints, AgentCore resources, and model
+invocations billed per token. Delete the stack when finished and
+confirm the deletion completes.
+
+Launch the stack in one of the two Regions that host the prebuilt assets:
+
+| Region | Launch |
+|---|---|
+| us-east-1 | [Launch stack](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks/create/review?templateURL=https://payment-ws-public-654654628042-us-east-1.s3.us-east-1.amazonaws.com/paymentriv2026/workshop.yml&stackName=payment-workshop) |
+| us-west-2 | [Launch stack](https://console.aws.amazon.com/cloudformation/home?region=us-west-2#/stacks/create/review?templateURL=https://payment-ws-public-654654628042-us-west-2.s3.us-west-2.amazonaws.com/paymentriv2026/workshop.yml&stackName=payment-workshop) |
+
+Deploy as an administrator of the account. The template and the code packages
+are read from a public bucket with your credentials, so a policy in your
+organization that denies Amazon S3 reads outside the organization blocks the
+deployment. Leave every parameter at its default. `IsWorkshopStudioEnv` stays
+`no`, which makes the template pull its assets from that bucket in the same
+Region. To run the stack in both Regions of one account, give the second stack
+a different name. Acknowledge the IAM capability the console lists and create
+the stack. When it
+completes, the stack's Outputs tab holds three values: the Payment Operations
+UI (`WebUIUrl`), the browser code editor (`CodeEditorUrl`) and the analyst
+sign-in (`AnalystLogin`).
+
+Treat all three values as credentials. They contain the generated analyst
+password, and the same password opens the code editor, which is a terminal on
+the EC2 workbench with an IAM role in your account. Do not share them or paste
+them into an issue or a screenshot. Deploy the stack in a sandbox account.
+
+The stack is the workshop's starting point. The workbench holds the workshop's
+starting code, and the deployed dispute agent gathers evidence but does not
+draft or route a decision. To build and deploy the rest, follow the workshop
+from the **In your own account** tab of its Getting started page.
+
+To clean up, delete the `payment-workshop` stack. If you deployed a second
+runtime with the `agentcore` CLI, delete its stack first. Its name starts with
+`AgentCore-`, and from the workbench it is `AgentCore-paymentagents-default`.
+The delete of `payment-workshop` can stop with `DELETE_FAILED` on the subnets.
+The agent runtime's network interfaces are removed some time after the
+runtime, often an hour later. Wait, then delete the stack again.
+
+The CDK bootstrap stack `CDKToolkit` and its staging bucket stay behind on
+purpose. If nothing else in the account uses the AWS CDK, delete the
+`CDKToolkit` stack. Then empty its `cdk-hnb659fds-assets-*` bucket, old object
+versions included, and delete the bucket. CloudFormation does not delete the
+CloudWatch log groups that the stack wrote to. Delete them in the CloudWatch
+console if you do not need them.
+
 **Dev loop.** The database has no public endpoint, so the agents run from a
 host inside the stack's VPC. In a deployed stack that host is the browser code
 editor. Its terminal opens in the agent workspace with the stack's settings

@@ -22,6 +22,7 @@ import time
 import urllib.request
 
 import boto3
+from botocore.exceptions import ClientError
 
 
 def _cfn_respond(event, context, status, data=None, reason=""):
@@ -49,6 +50,33 @@ def _secret(arn, region):
         return raw
 
 
+def _bucket_region(bucket, stack_region):
+    """Region of a bucket that another account may own.
+
+    GetBucketLocation needs a grant from the bucket's owner, and the public
+    asset bucket gives other accounts object reads only, so a self-deploy in
+    any other account was refused here. HeadBucket reports the Region in the
+    x-amz-bucket-region header even when it refuses the call (measured
+    2026-11-11 from a second account). Last resort: the stack's Region, which
+    is where the default asset bucket lives by its name."""
+    s3 = boto3.client("s3", region_name=stack_region)
+    try:
+        loc = s3.get_bucket_location(Bucket=bucket).get("LocationConstraint")
+        return loc or "us-east-1"   # LocationConstraint is None for us-east-1
+    except ClientError as e:
+        print(f"GetBucketLocation refused ({e.response['Error']['Code']}); "
+              "reading the Region from HeadBucket")
+    try:
+        headers = s3.head_bucket(Bucket=bucket)["ResponseMetadata"]["HTTPHeaders"]
+    except ClientError as e:
+        headers = e.response.get("ResponseMetadata", {}).get("HTTPHeaders", {})
+    found = headers.get("x-amz-bucket-region")
+    if found:
+        return found
+    print(f"bucket Region not reported; using the stack's Region {stack_region}")
+    return stack_region
+
+
 def handler(event, context):
     try:
         if event["RequestType"] == "Delete":
@@ -63,9 +91,8 @@ def handler(event, context):
 
         # aws_s3.table_import_from_s3's region arg must match the BUCKET's
         # region, not the stack's. Derive it.
-        loc = boto3.client("s3", region_name=region).get_bucket_location(
-            Bucket=p["SeedBucket"]).get("LocationConstraint")
-        bucket_region = loc or "us-east-1"   # LocationConstraint is None for us-east-1
+        bucket_region = _bucket_region(p["SeedBucket"], region)
+        print(f"seed bucket Region: {bucket_region}")
         master_pw = _secret(p["MasterSecretArn"], region)
         conn = psycopg.connect(host=p["DbHost"], port=5432, dbname="workshop",
                                user="postgres", password=master_pw,
