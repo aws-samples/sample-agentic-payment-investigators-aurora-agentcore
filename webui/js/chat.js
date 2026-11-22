@@ -43,11 +43,21 @@ export function makeThread(threadEl, agent, getScope) {
     const scrollIf = (want) => { if (want) threadEl.scrollTop = threadEl.scrollHeight; };
 
     const chips = new Map();   // tool_use_id -> {el, t0, timer}
+    let toolSinceText = false;  // a tool call started or ended since the last text chunk
     sessionId = await chat({ prompt: scoped, agent, sessionId }, (c) => {
       const stick = nearBottom();
       if (c.type === "text") {
+        // the model's remark before a tool call and its answer after it are
+        // separate text blocks with nothing between them: add a paragraph
+        // break, or they render joined ("…why it was filed.Why this case…")
+        if (c.text && toolSinceText) {
+          const t = textNode.textContent;   // break only if the text does not already end with one
+          if (t && !t.slice(t.trimEnd().length).includes("\n")) textNode.textContent += "\n\n";
+          toolSinceText = false;
+        }
         textNode.textContent += c.text;
       } else if (c.type === "tool_start") {
+        toolSinceText = true;
         const chip = document.createElement("span");
         chip.className = "toolchip running";
         chip.innerHTML = `<span class="chip-glyph">⚙</span> ${escapeHtml(c.tool)} <span class="t"></span>`;
@@ -60,6 +70,7 @@ export function makeThread(threadEl, agent, getScope) {
         chips.set(c.tool_use_id, { el: chip, t0, timer });
         chipRow.appendChild(chip);
       } else if (c.type === "tool_end") {
+        toolSinceText = true;
         const entry = chips.get(c.tool_use_id);
         if (entry) {
           clearInterval(entry.timer);
@@ -96,6 +107,15 @@ export function makeThread(threadEl, agent, getScope) {
   return { send };
 }
 
+// A trace id the model wrote WITHOUT the ledger's prefix: "trace 0ada0dc3-…",
+// "Trace ID: 0ada0dc3-…", "trace_id=0ada0dc3-…", "**Trace ID:** `0ada0dc3-…`",
+// "API trace 0ada0dc3-…". The ledger stores trace-<uuid> and api-trace-<uuid>;
+// models reword that, so the link cannot depend on the hyphen. Between the word
+// and the id only separators and the tags inline() produces may sit.
+// Only hex and hyphens are captured for the href (model output is untrusted).
+// Keep "-" OUT of the separator class: it would match inside an existing href.
+const BARE_TRACE = /\b((?:api[- ])?trace)((?:[ _-]?ids?)?(?:\s+is)?[\s:=#]*(?:<\/(?:strong|em|code)>[\s:=#]*)*)((?:<(?:code|strong|em)>)*)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b/gi;
+
 // minimal markdown for agent replies: escape-first, then bold/italic/code,
 // #### headings, -/*/1. lists, trace-id links. No library (design guardrail).
 export function renderMarkdown(raw) {
@@ -104,7 +124,10 @@ export function renderMarkdown(raw) {
     .replace(/`([^`\n]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, "$1<em>$2</em>")
-    .replace(/((?:api-)?trace-[0-9a-f-]{8,})/g, '<a class="id" href="#traces/$1">$1</a>');
+    .replace(/((?:api-)?trace-[0-9a-f-]{8,})/g, '<a class="id" href="#traces/$1">$1</a>')
+    .replace(BARE_TRACE, (m, word, sep, wrap, uuid) => (sep || wrap)
+      ? `${word}${sep}${wrap}<a class="id" href="#traces/${word.toLowerCase().replace(" ", "-")}-${uuid.toLowerCase()}">${uuid}</a>`
+      : m);
   const out = [];
   let inList = false;
   for (const line of esc.split("\n")) {
